@@ -1,171 +1,78 @@
-import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@/lib/supabase/server'
-import { buildDiagnosticContext } from '@/lib/rag-service'
+import { generateDiagnosisWithRAG } from '@/lib/ragsvc'
 import { findEducationalVideos } from '@/lib/video-search'
+import { incrementDiagnosticsUsage, checkDiagnosticsLimit } from '@/lib/usage-tracking'
+import { NextResponse } from 'next/server'
 
-export async function POST(request: NextRequest) {
+export async function POST(req: Request) {
+  const supabase = await createClient()
+
   try {
-    const formData = await request.formData()
-    const supabase = await createClient()
+    // 1. Authenticate the Shop/User
+    const { data: { user }, error: authError } = await supabase.auth.getUser()
+    if (authError || !user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
-    // Extract customer and vehicle info
-    const customerName = formData.get('customerName') as string
-    const customerEmail = formData.get('customerEmail') as string
-    const customerPhone = formData.get('customerPhone') as string
-    const vehicleYear = parseInt(formData.get('vehicleYear') as string)
-    const vehicleMake = formData.get('vehicleMake') as string
-    const vehicleModel = formData.get('vehicleModel') as string
-    const description = formData.get('description') as string
-    const imageFile = formData.get('image') as File | null
-    const audioFile = formData.get('audio') as File | null
+    // 2. Check Usage Limits (Don't run expensive AI if they're over limit)
+    const canRun = await checkDiagnosticsLimit(user.id)
+    if (!canRun) return NextResponse.json({ error: 'Monthly limit reached' }, { status: 403 })
 
-    console.log('[v0] Customer diagnostic request received:', { customerName, vehicleMake, vehicleModel })
+    // 3. Parse Request Data
+    const { description, symptoms, vehicleInfo, imageMetadata } = await req.json()
 
-    // Build RAG context from description
-    const ragContext = await buildDiagnosticContext(description)
+    // 4. Perform RAG Search (Search Supabase for similar past cases)
+    // We generate an embedding for the user's current problem
+    const { data: knowledgeMatches } = await supabase.rpc('match_repair_knowledge', {
+      query_embedding: await generateEmbedding(description), // Helper to call Gemini Embedding API
+      match_threshold: 0.5,
+      match_count: 3,
+    })
 
-    // Generate AI diagnosis (currently mock, will use Gemini with RAG when API key active)
-    const diagnosis = await generateDiagnosisWithRAG(description, ragContext)
+    const context = knowledgeMatches?.map((k: any) => k.content).join('\n---\n') || ''
 
-    console.log('[v0] Generated diagnosis:', diagnosis.diagnosis)
+    // 5. Generate AI Diagnosis via Gemini
+    const aiResult = await generateDiagnosisWithRAG(description, context)
 
-    // Find educational videos based on the actual diagnosis
-    const videos = await findEducationalVideos(
-      diagnosis.diagnosis,
-      [description], // Pass customer's description as symptoms
-      { year: vehicleYear, make: vehicleMake, model: vehicleModel }
+    // 6. Fetch Educational Videos (Parallel to save time)
+    const educationalVideos = await findEducationalVideos(
+      aiResult.diagnosis,
+      symptoms || [description],
+      vehicleInfo
     )
 
-    console.log('[v0] Found', videos.length, 'relevant educational videos')
-
-    // Store diagnostic request in database
-    const { data: request, error } = await supabase
-      .from('customer_diagnostic_requests')
+    // 7. Save to Database
+    const { data: record, error: saveError } = await supabase
+      .from('ai_diagnostics')
       .insert({
-        customer_name: customerName,
-        customer_email: customerEmail,
-        customer_phone: customerPhone,
-        vehicle_year: vehicleYear,
-        vehicle_make: vehicleMake,
-        vehicle_model: vehicleModel,
-        description: description,
-        image_url: imageFile ? await uploadFile(imageFile, supabase) : null,
-        audio_data: audioFile ? await uploadFile(audioFile, supabase) : null,
-        ai_diagnosis: diagnosis.diagnosis,
-        recommended_parts: diagnosis.recommendedParts,
-        estimated_cost: diagnosis.estimatedCost,
-        confidence_score: diagnosis.confidence,
-        educational_videos: videos, // Store video results
-        status: 'pending_review',
+        user_id: user.id,
+        input_data: description,
+        diagnosis: aiResult.diagnosis,
+        recommended_parts: aiResult.recommendedParts,
+        estimated_cost: aiResult.estimatedCost,
+        confidence_score: aiResult.confidence,
+        educational_videos: educationalVideos,
       })
       .select()
       .single()
 
-    if (error) {
-      console.error('[v0] Error saving diagnostic request:', error)
-      throw error
-    }
+    if (saveError) throw saveError
 
-    // Return request ID and videos
-    return NextResponse.json({
-      requestId: request.id,
-      diagnosis: diagnosis.diagnosis,
-      recommendedParts: diagnosis.recommendedParts,
-      estimatedCost: diagnosis.estimatedCost,
-      confidence: diagnosis.confidence,
-      videos: videos, // Include videos in response
-      statusUrl: `/customer/status/${request.id}`,
-    })
-  } catch (error) {
-    console.error('[v0] Customer diagnostics error:', error)
-    return NextResponse.json(
-      { error: 'Failed to process diagnostic request' },
-      { status: 500 }
-    )
+    // 8. Increment Usage Count
+    await incrementDiagnosticsUsage(user.id)
+
+    return NextResponse.json({ success: true, data: record })
+
+  } catch (error: any) {
+    console.error('Diagnostic Pipeline Error:', error)
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
-async function generateDiagnosisWithRAG(
-  description: string,
-  ragContext: string
-): Promise<{
-  diagnosis: string
-  recommendedParts: string[]
-  estimatedCost: number
-  confidence: number
-}> {
-  // Check if Gemini API key is available
-  const apiKey = process.env.GEMINI_API_KEY
-
-  if (!apiKey) {
-    console.log('[v0] No GEMINI_API_KEY - using enhanced mock with RAG context')
-    return generateEnhancedMockDiagnosis(description, ragContext)
-  }
-
-  // TODO: Implement real Gemini API call with RAG context
-  return generateEnhancedMockDiagnosis(description, ragContext)
-}
-
-function generateEnhancedMockDiagnosis(
-  description: string,
-  ragContext: string
-): {
-  diagnosis: string
-  recommendedParts: string[]
-  estimatedCost: number
-  confidence: number
-} {
-  const descLower = description.toLowerCase()
-  const hasRAG = ragContext && ragContext.length > 100
-
-  // Pattern match common issues
-  if (descLower.includes('belt') || descLower.includes('squealing')) {
-    return {
-      diagnosis: `${hasRAG ? '[RAG-ENHANCED] ' : ''}Belt noise detected. Likely worn serpentine belt or loose tensioner. ${hasRAG ? 'Knowledge base recommends inspecting belt for cracks and checking tensioner spring tension.' : ''}`,
-      recommendedParts: [
-        'Serpentine Belt - Part #BELT-4060',
-        'Belt Tensioner - Part #TENS-300',
-      ],
-      estimatedCost: 145.0,
-      confidence: hasRAG ? 88 : 82,
-    }
-  }
-
-  if (descLower.includes('crank') || descLower.includes('start')) {
-    return {
-      diagnosis: `${hasRAG ? '[RAG-ENHANCED] ' : ''}No-start condition. Likely weak battery or failing starter motor. ${hasRAG ? 'Knowledge base suggests testing battery voltage (should be 12.6V) and checking starter draw current.' : ''}`,
-      recommendedParts: [
-        'Starter Motor - Part #STR-8900',
-        'Battery (if load test fails) - Part #BAT-65',
-      ],
-      estimatedCost: 385.0,
-      confidence: hasRAG ? 85 : 78,
-    }
-  }
-
-  if (descLower.includes('noise') || descLower.includes('sound')) {
-    return {
-      diagnosis: `${hasRAG ? '[RAG-ENHANCED] ' : ''}Abnormal engine noise detected. Could indicate failing alternator bearing or accessory pulley. ${hasRAG ? 'Knowledge base recommends isolating noise source by removing accessory belts one at a time.' : ''}`,
-      recommendedParts: [
-        'Alternator Assembly - Part #ALT-7890',
-        'Idler Pulley - Part #PULL-450',
-      ],
-      estimatedCost: 425.0,
-      confidence: hasRAG ? 82 : 75,
-    }
-  }
-
-  // Default generic response
-  return {
-    diagnosis: `${hasRAG ? '[RAG-ENHANCED] ' : ''}Based on the description, preliminary diagnosis suggests general maintenance or component inspection needed. ${hasRAG ? 'Please review RAG context for specific recommendations.' : ''}`,
-    recommendedParts: ['Diagnostic Fee - Initial Inspection'],
-    estimatedCost: 125.0,
-    confidence: hasRAG ? 70 : 65,
-  }
-}
-
-async function uploadFile(file: File, supabase: any): Promise<string> {
-  // TODO: Implement Supabase Storage upload
-  // For now, return placeholder
-  return `placeholder_${file.name}`
+// Helper to call Gemini Embedding API (Required for the RPC search)
+async function generateEmbedding(text: string) {
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: 'POST',
+    body: JSON.stringify({ content: { parts: [{ text }] } })
+  })
+  const json = await response.json()
+  return json.embedding.values
 }
