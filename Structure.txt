@@ -1,0 +1,12 @@
+/
+├── app/               # Next.js App Router (UI Pages)
+├── components/        # UI primitives (Buttons, Cards, Toasts)
+├── hooks/             # useToast, useAuth
+├── lib/               
+│   ├── supabase/      # Client, Server, Middleware
+│   ├── integrations/  # Mitchell1, Tekmetric, ShopWare classes
+│   ├── ragsvc.ts      # The Gemini "Brain"
+│   └── video-search.ts # YouTube API logic
+├── supabase/          
+│   └── migrations/    # Store the SQL script I gave you here
+└── tailwind.config.ts
